@@ -367,7 +367,6 @@ def format_slip_summary(data: Dict[str, Any]) -> str:
 
 # --- ส่วนการทำงานหลักของโปรแกรม ---
 if __name__ == "__main__":
-    # <<<<<<<<---- ใส่ชื่อไฟล์รูปภาพสลิปของคุณที่นี่
     image_path = "S__67641364.jpg" 
     
     if not os.path.exists(image_path):
