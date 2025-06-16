@@ -9,10 +9,20 @@ import requests
 from PIL import Image
 import io
 import tempfile
-from .line_utils import LineBot, generate_help_message
+import logging
 
-# เปลี่ยนจาก SlipReader เป็น functions
-from .ocr_utils import extract_text_from_image, parse_payment_slip, format_slip_summary
+# [Import ฟังก์ชันที่จำเป็นทั้งหมด]
+from .line_utils import LineBot, generate_help_message
+from .ocr_utils import (
+    extract_text_from_image, 
+    parse_payment_slip, 
+    format_slip_summary,
+    setup_google_sheets_client,
+    log_to_google_sheet
+)
+
+# ตั้งค่า Logger
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -34,23 +44,19 @@ async def webhook(request: Request):
     try:
         signature = request.headers['X-Line-Signature']
         body = await request.body()
-        
         handler.handle(body.decode('utf-8'), signature)
         return {"status": "success"}
-        
     except InvalidSignatureError:
         raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e:
-        print(f"Webhook error: {str(e)}")
+        logger.error(f"Webhook error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @handler.add(MessageEvent, message=TextMessage)
-
 def handle_text_message(event):
     """จัดการข้อความ"""
     try:
         user_message = event.message.text.lower()
-        reply_text = generate_help_message()
         if user_message in ['hello', 'hi', 'สวัสดี', 'หวัดดี']:
             reply_text = """สวัสดีครับ! 👋
 
@@ -65,9 +71,7 @@ def handle_text_message(event):
 แค่ส่งรูปมาเลย! ระบบจะอ่านและแยกข้อมูลให้อัตโนมัติ
 
 🔥 พร้อมใช้งานแล้ว!"""
-            
         elif user_message in ['help', 'ช่วย', 'ช่วยเหลือ']:
-            reply_text = generate_help_message()
             reply_text = """🆘 **วิธีใช้งาน**
 
 1️⃣ **ส่งรูปสลิปเงิน**
@@ -83,7 +87,6 @@ def handle_text_message(event):
    • รองรับภาษาไทย + อังกฤษ
 
 💡 **เคล็ดลับ:** ถ่ายรูปให้ชัด แสงสว่างพอ เพื่อผลลัพธ์ที่ดีที่สุด"""
-            
         else:
             reply_text = f"""ได้รับข้อความ: "{event.message.text}"
 
@@ -98,9 +101,8 @@ def handle_text_message(event):
             event.reply_token,
             TextSendMessage(text=reply_text)
         )
-        
     except Exception as e:
-        print(f"Error handling text message: {str(e)}")
+        logger.error(f"Error handling text message: {str(e)}")
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text="เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง")
@@ -109,22 +111,18 @@ def handle_text_message(event):
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     """จัดการรูปภาพ"""
+    temp_file_path = None
     try:
-        # ดาวน์โหลดรูปภาพจาก LINE
         message_content = line_bot_api.get_message_content(event.message.id)
-        
-        # สร้างไฟล์ชั่วคราว
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
             for chunk in message_content.iter_content():
                 temp_file.write(chunk)
             temp_file_path = temp_file.name
         
-        # อ่านข้อความจากรูป
-        try:
-            extracted_text = extract_text_from_image(temp_file_path)
-            
-            if not extracted_text or len(extracted_text.strip()) < 3:
-                reply_text = """😅 **ไม่สามารถอ่านข้อความได้**
+        extracted_text = extract_text_from_image(temp_file_path)
+        
+        if not extracted_text or len(extracted_text.strip()) < 3:
+            reply_text = """😅 **ไม่สามารถอ่านข้อความได้**
 
 🔍 **เคล็ดลับ:**
 • ถ่ายรูปให้ชัดขึ้น
@@ -133,46 +131,38 @@ def handle_image_message(event):
 • ลองถ่ายใกล้ขึ้น
 
 📷 ลองส่งรูปใหม่ดูครับ!"""
-            else:
-                # แยกข้อมูลสลิป
-                parsed_data = parse_payment_slip(extracted_text)
-                
-                # ตรวจสอบว่าเป็นสลิปเงินหรือไม่
-                if parsed_data["amount"] or any([
-                    "จำนวนเงิน" in extracted_text,
-                    "บาท" in extracted_text,
-                    "THB" in extracted_text,
-                    "Amount" in extracted_text
-                ]):
-                    # เป็นสลิปเงิน
-                    reply_text = format_slip_summary(parsed_data)
-                else:
-                    # เป็นข้อความทั่วไป
-                    reply_text = f"""📄 **ข้อความที่อ่านได้:**
-
-```
-{extracted_text}
-```
-
-📝 **จำนวนตัวอักษร:** {len(extracted_text)} ตัว
-🔤 **จำนวนบรรทัด:** {len(extracted_text.split())} บรรทัด"""
+        else:
+            parsed_data = parse_payment_slip(extracted_text)
             
-        except Exception as ocr_error:
-            print(f"OCR Error: {str(ocr_error)}")
-            reply_text = f"❌ เกิดข้อผิดพลาดในการอ่านรูป: {str(ocr_error)}"
+            is_slip = parsed_data.get("amount") or any(kw in extracted_text for kw in ["จำนวนเงิน", "บาท", "THB", "Amount"])
+            
+            if is_slip:
+                reply_text = format_slip_summary(parsed_data)
+                
+                try:
+                    logger.info(">>> เป็นสลิป! กำลังเริ่มขั้นตอนการบันทึกลง Google Sheet...")
+                    sheets_client = setup_google_sheets_client()
+                    if sheets_client:
+                        log_to_google_sheet(sheets_client, parsed_data)
+                    else:
+                        logger.error("!!! ข้ามการบันทึกข้อมูลลง Google Sheet เพราะเชื่อมต่อไม่ได้")
+                except Exception as e:
+                    logger.error(f"!!! เกิดข้อผิดพลาดร้ายแรงขณะบันทึกลง Sheet: {e}")
+            else:
+                reply_text = f"""📄 **ข้อความที่อ่านได้:**
+                📝 **จำนวนตัวอักษร:** {len(extracted_text)} ตัว
+🔤 **จำนวนบรรทัด:** {len(extracted_text.splitlines())} บรรทัด"""
         
-        # ลบไฟล์ชั่วคราว
-        os.unlink(temp_file_path)
-        
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply_text)
-        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         
     except Exception as e:
-        print(f"Error handling image: {str(e)}")
+        logger.error(f"Error handling image: {str(e)}")
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text="เกิดข้อผิดพลาดในการประมวลผลรูปภาพ กรุณาลองใหม่อีกครั้ง")
         )
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+
 webhook_router = router
